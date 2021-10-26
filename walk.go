@@ -124,6 +124,13 @@ func (gw *GitHubWalker) walkDirectoryContents(ctx context.Context, contents []*g
 
 	for _, e := range contents {
 
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			// pass
+		}
+
 		err := gw.WalkURI(ctx, *e.Path)
 
 		if err != nil {
@@ -145,6 +152,13 @@ func (gw *GitHubWalker) walkDirectoryContentsConcurrently(ctx context.Context, c
 	defer cancel()
 
 	for _, e := range contents {
+
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			// pass
+		}
 
 		go func(e *github.RepositoryContent) {
 
