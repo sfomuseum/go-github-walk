@@ -20,14 +20,20 @@ type WalkCallbackFunc func(context.Context, *github.RepositoryContent) error
 
 // GitHubWalker is a struct that wraps operations for walking all the files in a GitHub repository.
 type GitHubWalker struct {
-	owner         string
-	repo          string
-	branch        string
-	concurrent    bool
-	client        *github.Client
-	api_throttle  <-chan time.Time
-	read_throttle chan bool
-	max_workers   int
+	// A valid GitHub user or organization name.
+	owner string
+	// A valid GitHub repository name.
+	repo string
+	// A valid GitHub repository branch.
+	branch string
+	// A boolean flag indicating whether directory contents should be processed concurrently.
+	concurrent bool
+	// A  *github.Client instance
+	client *github.Client
+	// A time.Tick instance liming the maximum number of API requests to 5/sec.
+	api_throttle <-chan time.Time
+	// A boolean flag indicating whether on an GitHub API rate limit error the GitHubWalker should pause until the specified reset time.
+	wait_on_reset bool
 }
 
 // NewGitHubWalker will create a new `GitHubWalker` instance from details defined in uri. uri takes the form of:
@@ -45,7 +51,7 @@ type GitHubWalker struct {
 // access_token: A valid GitHub API access token (required).
 // branch: A valid GitHub repository branch to walk.
 // concurrent: A boolean flag indicating whether directory contents should be processed concurrently.
-// workers: The maximum number of workers for concurrent processing.
+// wait-on-reset: A boolean flag indicating whether on an GitHub API rate limit error the GitHubWalker should pause until the specified reset time.
 func NewGitHubWalker(ctx context.Context, uri string) (*GitHubWalker, error) {
 
 	u, err := url.Parse(uri)
@@ -54,7 +60,7 @@ func NewGitHubWalker(ctx context.Context, uri string) (*GitHubWalker, error) {
 		return nil, fmt.Errorf("Failed to parse URI, %w", err)
 	}
 
-	rate := time.Second / 10
+	rate := time.Second / 5
 	api_throttle := time.Tick(rate)
 
 	gw := &GitHubWalker{
@@ -78,7 +84,7 @@ func NewGitHubWalker(ctx context.Context, uri string) (*GitHubWalker, error) {
 	token := q.Get("access_token")
 	branch := q.Get("branch")
 	concurrent := q.Get("concurrent")
-	workers := q.Get("workers")
+	wait := q.Get("wait-on-reset")
 
 	if token == "" {
 		return nil, fmt.Errorf("Missing access token")
@@ -98,28 +104,17 @@ func NewGitHubWalker(ctx context.Context, uri string) (*GitHubWalker, error) {
 
 		gw.concurrent = c
 
-		max_workers := 100
+	}
 
-		if workers != "" {
+	if wait != "" {
 
-			w, err := strconv.Atoi(workers)
+		w, err := strconv.ParseBool(wait)
 
-			if err != nil {
-				return nil, fmt.Errorf("Failed to parse workers parameter, %w", err)
-			}
-
-			max_workers = w
+		if err != nil {
+			return nil, fmt.Errorf("Failed to parse wait-on-reset parameter, %w", err)
 		}
 
-		gw.max_workers = max_workers
-
-		read_throttle := make(chan bool, gw.max_workers)
-
-		for i := 0; i < gw.max_workers; i++ {
-			read_throttle <- true
-		}
-
-		gw.read_throttle = read_throttle
+		gw.wait_on_reset = w
 	}
 
 	ts := oauth2.StaticTokenSource(
@@ -137,7 +132,11 @@ func NewGitHubWalker(ctx context.Context, uri string) (*GitHubWalker, error) {
 // a directory then each of its children will be processed by calling gw.WalkURI.
 func (gw *GitHubWalker) WalkURI(ctx context.Context, uri string, cb WalkCallbackFunc) error {
 
+	// fmt.Printf("walk %s\n", uri)
+
 	// log.Printf("Walk %s/%s/%s", gw.owner, gw.repo, uri)
+
+	<-gw.api_throttle
 
 	select {
 	case <-ctx.Done():
@@ -146,13 +145,36 @@ func (gw *GitHubWalker) WalkURI(ctx context.Context, uri string, cb WalkCallback
 		// pass
 	}
 
+	// https://pkg.go.dev/github.com/google/go-github/v39/github#hdr-Rate_Limiting
+	// https://docs.github.com/en/rest/overview/resources-in-the-rest-api#rate-limiting
+
 	// https://pkg.go.dev/github.com/google/go-github/v39/github#RepositoriesService.GetContents
 	// https://docs.github.com/en/rest/reference/repos#get-repository-content
 	// https://pkg.go.dev/github.com/google/go-github/v39/github#RepositoryContentGetOptions
 
-	file_contents, dir_contents, _, err := gw.client.Repositories.GetContents(ctx, gw.owner, gw.repo, uri, nil)
+	file_contents, dir_contents, rsp, err := gw.client.Repositories.GetContents(ctx, gw.owner, gw.repo, uri, nil)
+
+	/*
+		rate_limit := rsp.Rate.Limit
+		rate_remaining := rsp.Rate.Remaining
+		fmt.Printf("Fetch %s (%d/%d)\n", uri, rate_remaining, rate_limit)
+	*/
 
 	if err != nil {
+
+		_, is_rate_limit_err := err.(*github.RateLimitError)
+
+		if is_rate_limit_err && gw.wait_on_reset {
+
+			reset := rsp.Rate.Reset.Unix()
+			now := time.Now().Unix()
+
+			sleep := time.Duration(reset - now)
+
+			<-time.After(sleep * time.Second)
+			return gw.WalkURI(ctx, uri, cb)
+		}
+
 		return fmt.Errorf("Failed to get contents for %s, %w", uri, err)
 	}
 
@@ -215,8 +237,6 @@ func (gw *GitHubWalker) walkDirectoryContentsConcurrently(ctx context.Context, c
 
 	for _, e := range contents {
 
-		<-gw.read_throttle
-
 		select {
 		case <-ctx.Done():
 			return nil
@@ -228,7 +248,6 @@ func (gw *GitHubWalker) walkDirectoryContentsConcurrently(ctx context.Context, c
 
 			defer func() {
 				done_ch <- true
-				gw.read_throttle <- true
 			}()
 
 			err := gw.WalkURI(ctx, *e.Path, cb)
